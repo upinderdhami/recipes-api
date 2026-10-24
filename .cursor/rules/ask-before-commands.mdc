@@ -1,0 +1,26 @@
+---
+description: Ask the user for permission before running any command on their machine
+alwaysApply: true
+---
+
+# Ask before every command
+
+Never run a command on the user's machine without asking first and waiting for an explicit yes.
+
+This includes Shell, terminal, package managers (poetry, pip, npm), git, tests, servers, file-system commands (`ls`, `dir`, `mkdir`, `rm`), and any other executable.
+
+## Required flow
+
+1. State the exact command and why you want to run it.
+2. Ask for permission. Do not execute yet.
+3. Run it only after the user clearly agrees (for example: yes, ok, go ahead, run it).
+4. If they refuse or do not answer, do not run it. Offer an alternative they can run themselves if useful.
+
+## Examples
+
+- ❌ BAD: Silently run `poetry install` because it seems needed.
+- ✅ GOOD: "I want to run `poetry install` to install dependencies. May I?"
+- ❌ BAD: Chain extra commands after they approved a different one.
+- ✅ GOOD: If you need another command, ask again with the new exact command.
+
+One approval covers only the command(s) you listed in that ask. Do not treat it as blanket permission for the rest of the session.
