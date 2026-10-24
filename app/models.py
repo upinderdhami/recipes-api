@@ -1,5 +1,5 @@
-from django.db import models
 from django.conf import settings
+from django.db import models
 
 
 class Recipe(models.Model):
@@ -13,12 +13,8 @@ class Recipe(models.Model):
 
 
 class RecipeRating(models.Model):
-    recipe = models.ForeignKey(
-        Recipe, on_delete=models.CASCADE, related_name="ratings"
-    )
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.CASCADE
-    )
+    recipe = models.ForeignKey(Recipe, on_delete=models.CASCADE, related_name="ratings")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     stars = models.PositiveSmallIntegerField(
         choices=[(i, f"{i} star{'s' if i>1 else ''}") for i in range(1, 6)]
     )
