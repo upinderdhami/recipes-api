@@ -1,5 +1,5 @@
 """
-Stage 2–3 — Multi-agent PR review: ContextAgent + CommentorAgent + AgentWorkflow.
+Stages 2–4 — Multi-agent PR review (context → draft → review & post).
 """
 
 import asyncio
@@ -122,6 +122,23 @@ async def add_comment_to_state(ctx: Context, draft_comment: str) -> str:
     return "Draft comment saved to state."
 
 
+# --- Stage 4 Step A: final review state + post to GitHub ---------------------
+async def add_final_review_to_state(ctx: Context, final_review: str) -> str:
+    """Save the approved final review into workflow state before posting."""
+    current_state = await ctx.store.get("state")
+    current_state["final_review"] = final_review
+    await ctx.store.set("state", current_state)
+    return "Final review saved to state."
+
+
+def post_review_to_github(pr_number: int, comment: str) -> str:
+    """Post the final review comment on a pull request (GitHub create_review)."""
+    pull_request = repo.get_pull(pr_number)
+    # event=COMMENT publishes a review comment without approving/requesting changes.
+    pull_request.create_review(body=comment, event="COMMENT")
+    return f"Review posted to PR #{pr_number}."
+
+
 # --- Wrap functions as tools the LLM can call --------------------------------
 # FunctionTool reads: function name + docstring + type hints → JSON schema for the LLM.
 get_pr_details_tool = FunctionTool.from_defaults(fn=get_pr_details)
@@ -129,6 +146,8 @@ get_file_contents_tool = FunctionTool.from_defaults(fn=get_file_contents)
 get_commit_details_tool = FunctionTool.from_defaults(fn=get_commit_details)
 add_context_to_state_tool = FunctionTool.from_defaults(fn=add_context_to_state)
 add_comment_to_state_tool = FunctionTool.from_defaults(fn=add_comment_to_state)
+add_final_review_to_state_tool = FunctionTool.from_defaults(fn=add_final_review_to_state)
+post_review_to_github_tool = FunctionTool.from_defaults(fn=post_review_to_github)
 
 # GitHub tools (ContextAgent) + state tools (split per agent below)
 github_tools = [
@@ -185,6 +204,7 @@ Ensure to do the following for a thorough review:
  - If you need any additional details, you must hand off to the ContextAgent.
  - You should directly address the author. So your comments should sound like:
  "Thanks for fixing this. I think all places where we call quote should be fixed. Can you roll this fix out everywhere?"
+ - You must hand off to the ReviewAndPostingAgent once you are done drafting a review.
 """
 
 commentor_agent = FunctionAgent(
@@ -196,24 +216,53 @@ commentor_agent = FunctionAgent(
     ),
     system_prompt=COMMENTOR_AGENT_SYSTEM_PROMPT,
     tools=[add_comment_to_state_tool],
-    can_handoff_to=["ContextAgent"],
+    can_handoff_to=["ContextAgent", "ReviewAndPostingAgent"],
 )
 
 
-# --- Stage 3 Step D: AgentWorkflow (orchestrator) ----------------------------
-# Workflow owns both agents, starts at CommentorAgent, and seeds shared state.
-# Commentor asks for data → handoff → Context gathers → handoff back → draft.
+# --- Stage 4 Step B: ReviewAndPostingAgent -----------------------------------
+# QA gate: get a draft from Commentor, check quality, rewrite if needed, then post.
+REVIEW_AND_POSTING_SYSTEM_PROMPT = """You are the Review and Posting agent. You must use the CommentorAgent to create a review comment.
+Once a review is generated, you need to run a final check and post it to GitHub.
+ - The review must:
+ - Be a ~200-300 word review in markdown format.
+ - Specify what is good about the PR:
+ - Did the author follow ALL contribution rules? What is missing?
+ - Are there notes on test availability for new functionality? If there are new models, are there migrations for them?
+ - Are there notes on whether new endpoints were documented?
+ - Are there suggestions on which lines could be improved upon? Are these lines quoted?
+ If the review does not meet this criteria, you must ask the CommentorAgent to rewrite and address these concerns.
+ When you are satisfied, post the review to GitHub.
+"""
+
+review_and_posting_agent = FunctionAgent(
+    llm=llm,
+    name="ReviewAndPostingAgent",
+    description=(
+        "Reviews the draft PR comment for quality, requests rewrites if needed, "
+        "saves the final review to state, and posts it to GitHub."
+    ),
+    system_prompt=REVIEW_AND_POSTING_SYSTEM_PROMPT,
+    tools=[add_final_review_to_state_tool, post_review_to_github_tool],
+    can_handoff_to=["CommentorAgent"],
+)
+
+
+# --- Stage 4 Step C: AgentWorkflow with all three agents ---------------------
+# Root = ReviewAndPostingAgent: it requests a draft, may ask for rewrites, then posts.
+# Flow: Review → Commentor → Context → Commentor → Review → post to GitHub.
 workflow_agent = AgentWorkflow(
-    agents=[context_agent, commentor_agent],
-    root_agent=commentor_agent.name,
+    agents=[context_agent, commentor_agent, review_and_posting_agent],
+    root_agent=review_and_posting_agent.name,
     initial_state={
         "gathered_contexts": "",
         "draft_comment": "",
+        "final_review": "",
     },
 )
 
 
-# --- Stage 3 Step E: stream workflow events ----------------------------------
+# --- Stream workflow events --------------------------------------------------
 async def main() -> None:
     """Read one question, run the multi-agent workflow, stream handoffs/tools."""
     query = input().strip()
@@ -259,7 +308,7 @@ def _smoke_test() -> None:
             print()
     elif command == "agent-info":
         print(f"LLM model: {os.getenv('OPENAI_MODEL')}")
-        for agent in (context_agent, commentor_agent):
+        for agent in (context_agent, commentor_agent, review_and_posting_agent):
             print(f"\nAgent: {agent.name}")
             print(f"  Description: {agent.description}")
             print(f"  Tools: {[t.metadata.name for t in agent.tools]}")
@@ -276,9 +325,10 @@ def _smoke_test() -> None:
 
 
 if __name__ == "__main__":
-    # Default: multi-agent workflow (stage 3). Pass a smoke command to skip chat.
+    # Default: full 3-agent workflow (stage 4). Pass a smoke command to skip chat.
     #   poetry run python agent.py
-    #   A new PR number 1 has been created. Write a review for it.
+    #   A new PR number 1 has been created. Gather context, draft a review,
+    #   validate it, and post the final review to GitHub.
     if len(sys.argv) > 1 and sys.argv[1] in {
         "pr",
         "file",
