@@ -1,5 +1,8 @@
 """
-Stages 2–4 — Multi-agent PR review (context → draft → review & post).
+Stages 2–5 — Multi-agent PR review (local + GitHub Actions).
+
+CI sets GITHUB_TOKEN, REPOSITORY, PR_NUMBER, OPENAI_* via the workflow env.
+Locally, use .env and interactive input() when PR_NUMBER is unset.
 """
 
 import asyncio
@@ -25,21 +28,26 @@ from llama_index.llms.openai import OpenAI
 load_dotenv()
 
 # --- GitHub client -----------------------------------------------------------
-# PyGithub talks to GitHub's API using your Personal Access Token.
+# Local: GITHUB_TOKEN from .env. CI: secrets.GITHUB_TOKEN from the workflow.
 token = os.getenv("GITHUB_TOKEN")
 if not token:
-    raise RuntimeError("GITHUB_TOKEN is missing from .env")
+    raise RuntimeError("GITHUB_TOKEN is missing (set .env locally or workflow env in CI)")
 
 git = Github(auth=Auth.Token(token))
 
-# Which repo the agent will inspect. Override with GITHUB_REPO_URL in .env if needed.
-repo_url = os.getenv(
-    "GITHUB_REPO_URL",
-    "https://github.com/upinderdhami/recipes-api.git",
-)
-repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
-username = repo_url.rstrip("/").split("/")[-2]
-full_repo_name = f"{username}/{repo_name}"
+# CI passes REPOSITORY as "owner/repo". Locally fall back to GITHUB_REPO_URL.
+full_repo_name = os.getenv("REPOSITORY")
+if not full_repo_name:
+    repo_url = os.getenv(
+        "GITHUB_REPO_URL",
+        "https://github.com/upinderdhami/recipes-api.git",
+    )
+    repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
+    username = repo_url.rstrip("/").split("/")[-2]
+    full_repo_name = f"{username}/{repo_name}"
+
+# PR number from Actions; unset when running interactively locally.
+pr_number = os.getenv("PR_NUMBER")
 
 repo = git.get_repo(full_repo_name)
 
@@ -163,9 +171,9 @@ tools = github_tools
 # FunctionAgent (vs ReActAgent): still uses tools, but fits AgentWorkflow handoffs.
 # can_handoff_to = names of agents it may pass control to (CommentorAgent in Step C).
 llm = OpenAI(
-    model=os.getenv("OPENAI_MODEL"),
+    model=os.getenv("OPENAI_MODEL") or "gpt-4o-mini",
     api_key=os.getenv("OPENAI_API_KEY"),
-    api_base=os.getenv("OPENAI_BASE_URL"),
+    api_base=os.getenv("OPENAI_BASE_URL") or None,
 )
 
 CONTEXT_AGENT_SYSTEM_PROMPT = """You are the context gathering agent. When gathering context, you MUST gather
@@ -264,10 +272,19 @@ workflow_agent = AgentWorkflow(
 
 # --- Stream workflow events --------------------------------------------------
 async def main() -> None:
-    """Read one question, run the multi-agent workflow, stream handoffs/tools."""
-    query = input().strip()
-    prompt = RichPromptTemplate(query)
+    """Run the multi-agent workflow (CI uses PR_NUMBER; local uses stdin)."""
+    # GitHub Actions cannot prompt — query is built from the PR that triggered CI.
+    if pr_number:
+        query = (
+            f"Write a review for PR number {pr_number}. "
+            "Gather all context, draft a full review, validate it against the "
+            "checklist, and post the final review to GitHub."
+        )
+        print(f"CI mode: reviewing {full_repo_name} PR #{pr_number}")
+    else:
+        query = input().strip()
 
+    prompt = RichPromptTemplate(query)
     handler = workflow_agent.run(prompt.format())
 
     current_agent = None
