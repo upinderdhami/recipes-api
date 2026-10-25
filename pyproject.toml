@@ -39,10 +39,15 @@ jq = ">=1.8.0,<2.0.0"
 
 
 
-[[tool.poetry.source]]
-name = "workday-pypi"
-url = "https://artifactory.workday.com/artifactory/api/pypi/pypi.python.org2/simple"
-priority = "primary"
+# Workday Artifactory PyPI mirror — INTERNAL ONLY.
+# Commented out so GitHub Actions / public CI can install from public PyPI.
+# On a Workday laptop (where pypi.org may be blocked), uncomment these four
+# lines, run `poetry install` / `poetry add`, then comment them out again
+# before committing so CI does not break.
+# [[tool.poetry.source]]
+# name = "workday-pypi"
+# url = "https://artifactory.workday.com/artifactory/api/pypi/pypi.python.org2/simple"
+# priority = "primary"
 
 [tool.coverage.run]
 relative_files = true
