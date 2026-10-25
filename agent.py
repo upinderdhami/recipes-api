@@ -1,0 +1,359 @@
+"""
+Stages 2–5 — Multi-agent PR review (local + GitHub Actions).
+
+CI sets GITHUB_TOKEN, REPOSITORY, PR_NUMBER, OPENAI_* via the workflow env.
+Locally, use .env and interactive input() when PR_NUMBER is unset.
+"""
+
+import asyncio
+import os
+import sys
+from typing import Any
+
+from dotenv import load_dotenv
+from github import Auth, Github
+from github.GithubException import UnknownObjectException
+from llama_index.core.agent.workflow import (
+    AgentOutput,
+    AgentWorkflow,
+    FunctionAgent,
+    ToolCall,
+    ToolCallResult,
+)
+from llama_index.core.prompts import RichPromptTemplate
+from llama_index.core.tools import FunctionTool
+from llama_index.core.workflow import Context
+from llama_index.llms.openai import OpenAI
+
+load_dotenv()
+
+# --- GitHub client -----------------------------------------------------------
+# Local: GITHUB_TOKEN from .env. CI: secrets.GITHUB_TOKEN from the workflow.
+token = os.getenv("GITHUB_TOKEN")
+if not token:
+    raise RuntimeError("GITHUB_TOKEN is missing (set .env locally or workflow env in CI)")
+
+git = Github(auth=Auth.Token(token))
+
+# CI passes REPOSITORY as "owner/repo". Locally fall back to GITHUB_REPO_URL.
+full_repo_name = os.getenv("REPOSITORY")
+if not full_repo_name:
+    repo_url = os.getenv(
+        "GITHUB_REPO_URL",
+        "https://github.com/upinderdhami/recipes-api.git",
+    )
+    repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
+    username = repo_url.rstrip("/").split("/")[-2]
+    full_repo_name = f"{username}/{repo_name}"
+
+# PR number from Actions; unset when running interactively locally.
+pr_number = os.getenv("PR_NUMBER")
+
+repo = git.get_repo(full_repo_name)
+
+
+# --- Tool function 1: PR details ---------------------------------------------
+def get_pr_details(pr_number: int) -> dict[str, Any]:
+    """Fetch pull request details: author, title, body, diff_url, state, commits."""
+    pull_request = repo.get_pull(pr_number)
+
+    commit_shas: list[str] = []
+    for c in pull_request.get_commits():
+        commit_shas.append(c.sha)
+
+    return {
+        "user": pull_request.user.login,
+        "title": pull_request.title,
+        "body": pull_request.body,
+        "diff_url": pull_request.diff_url,
+        "state": pull_request.state,
+        "commit_shas": commit_shas,
+        "head_sha": pull_request.head.sha,
+    }
+
+
+# --- Tool function 2: file contents ------------------------------------------
+def get_file_contents(file_path: str) -> str:
+    """Fetch the text contents of a file from the repository given its path."""
+    try:
+        content_file = repo.get_contents(file_path)
+    except UnknownObjectException:
+        return f"File not found: {file_path}"
+
+    # get_contents can return a list if file_path is a directory — we only want files.
+    if isinstance(content_file, list):
+        return f"Path is a directory, not a file: {file_path}"
+
+    return content_file.decoded_content.decode("utf-8")
+
+
+# --- Tool function 3: commit / changed-file details --------------------------
+def get_commit_details(commit_sha: str) -> list[dict[str, Any]]:
+    """Fetch changed files for a commit: filename, status, additions, deletions, patch."""
+    commit = repo.get_commit(commit_sha)
+
+    changed_files: list[dict[str, Any]] = []
+    for f in commit.files:
+        changed_files.append(
+            {
+                "filename": f.filename,
+                "status": f.status,  # e.g. added, modified, removed
+                "additions": f.additions,
+                "deletions": f.deletions,
+                "changes": f.changes,
+                "patch": f.patch,  # the unified diff text (may be None for binaries)
+            }
+        )
+    return changed_files
+
+
+# --- Stage 3 Step A: shared state tools --------------------------------------
+# Multi-agent systems need a shared "notebook" (state). Agents write here so the
+# next agent can read what they produced. LlamaIndex injects `ctx` automatically
+# when the first parameter is typed as Context.
+
+
+async def add_context_to_state(ctx: Context, context: str) -> str:
+    """Save gathered PR context into workflow state for other agents to use."""
+    # Newer LlamaIndex: state lives on ctx.store (not ctx.get/set from older docs).
+    current_state = await ctx.store.get("state")
+    current_state["gathered_contexts"] = context
+    await ctx.store.set("state", current_state)
+    return "Context saved to state."
+
+
+async def add_comment_to_state(ctx: Context, draft_comment: str) -> str:
+    """Save a draft PR review comment into workflow state."""
+    current_state = await ctx.store.get("state")
+    current_state["draft_comment"] = draft_comment
+    await ctx.store.set("state", current_state)
+    return "Draft comment saved to state."
+
+
+# --- Stage 4 Step A: final review state + post to GitHub ---------------------
+async def add_final_review_to_state(ctx: Context, final_review: str) -> str:
+    """Save the approved final review into workflow state before posting."""
+    current_state = await ctx.store.get("state")
+    current_state["final_review"] = final_review
+    await ctx.store.set("state", current_state)
+    return "Final review saved to state."
+
+
+def post_review_to_github(pr_number: int, comment: str) -> str:
+    """Post the final review comment on a pull request (GitHub create_review)."""
+    pull_request = repo.get_pull(pr_number)
+    # event=COMMENT publishes a review comment without approving/requesting changes.
+    pull_request.create_review(body=comment, event="COMMENT")
+    return f"Review posted to PR #{pr_number}."
+
+
+# --- Wrap functions as tools the LLM can call --------------------------------
+# FunctionTool reads: function name + docstring + type hints → JSON schema for the LLM.
+get_pr_details_tool = FunctionTool.from_defaults(fn=get_pr_details)
+get_file_contents_tool = FunctionTool.from_defaults(fn=get_file_contents)
+get_commit_details_tool = FunctionTool.from_defaults(fn=get_commit_details)
+add_context_to_state_tool = FunctionTool.from_defaults(fn=add_context_to_state)
+add_comment_to_state_tool = FunctionTool.from_defaults(fn=add_comment_to_state)
+add_final_review_to_state_tool = FunctionTool.from_defaults(fn=add_final_review_to_state)
+post_review_to_github_tool = FunctionTool.from_defaults(fn=post_review_to_github)
+
+# GitHub tools (ContextAgent) + state tools (split per agent below)
+github_tools = [
+    get_pr_details_tool,
+    get_file_contents_tool,
+    get_commit_details_tool,
+]
+# Keep old name for smoke-test helper
+tools = github_tools
+
+
+# --- Stage 3 Step B: ContextAgent as FunctionAgent ---------------------------
+# FunctionAgent (vs ReActAgent): still uses tools, but fits AgentWorkflow handoffs.
+# can_handoff_to = names of agents it may pass control to (CommentorAgent in Step C).
+llm = OpenAI(
+    model=os.getenv("OPENAI_MODEL") or "gpt-4o-mini",
+    api_key=os.getenv("OPENAI_API_KEY"),
+    api_base=os.getenv("OPENAI_BASE_URL") or None,
+)
+
+CONTEXT_AGENT_SYSTEM_PROMPT = """You are the context gathering agent. When gathering context, you MUST gather
+:
+ - The details: author, title, body, diff_url, state, and head_sha;
+ - Changed files;
+ - Any requested for files;
+Once you gather the requested info, you MUST hand control back to the Commentor Agent.
+"""
+
+context_agent = FunctionAgent(
+    llm=llm,
+    name="ContextAgent",
+    description=(
+        "Gathers all needed PR context from GitHub (details, commits, files), "
+        "saves it to state, then hands off to CommentorAgent."
+    ),
+    system_prompt=CONTEXT_AGENT_SYSTEM_PROMPT,
+    tools=[*github_tools, add_context_to_state_tool],
+    can_handoff_to=["CommentorAgent"],
+)
+
+
+# --- Stage 3 Step C: CommentorAgent ------------------------------------------
+# This agent does NOT call GitHub directly. It asks ContextAgent for data
+# (handoff), then writes a human-style review and saves it with add_comment_to_state.
+COMMENTOR_AGENT_SYSTEM_PROMPT = """You are the commentor agent that writes review comments for pull requests as a human reviewer would.
+Ensure to do the following for a thorough review:
+ - Request for the PR details, changed files, and any other repo files you may need from the ContextAgent.
+ - Once you have asked for all the needed information, write a good ~200-300 word review in markdown format detailing:
+ - What is good about the PR?
+ - Did the author follow ALL contribution rules? What is missing?
+ - Are there tests for new functionality? If there are new models, are there migrations for them? - use the diff to determine this.
+ - Are new endpoints documented? - use the diff to determine this.
+ - Which lines could be improved upon? Quote these lines and offer suggestions the author could implement.
+ - If you need any additional details, you must hand off to the ContextAgent.
+ - You should directly address the author. So your comments should sound like:
+ "Thanks for fixing this. I think all places where we call quote should be fixed. Can you roll this fix out everywhere?"
+ - You must hand off to the ReviewAndPostingAgent once you are done drafting a review.
+"""
+
+commentor_agent = FunctionAgent(
+    llm=llm,
+    name="CommentorAgent",
+    description=(
+        "Uses the context gathered by the ContextAgent to draft a pull request "
+        "review comment."
+    ),
+    system_prompt=COMMENTOR_AGENT_SYSTEM_PROMPT,
+    tools=[add_comment_to_state_tool],
+    can_handoff_to=["ContextAgent", "ReviewAndPostingAgent"],
+)
+
+
+# --- Stage 4 Step B: ReviewAndPostingAgent -----------------------------------
+# QA gate: get a draft from Commentor, check quality, rewrite if needed, then post.
+REVIEW_AND_POSTING_SYSTEM_PROMPT = """You are the Review and Posting agent. You must use the CommentorAgent to create a review comment.
+Once a review is generated, you need to run a final check and post it to GitHub.
+ - The review must:
+ - Be a ~200-300 word review in markdown format.
+ - Specify what is good about the PR:
+ - Did the author follow ALL contribution rules? What is missing?
+ - Are there notes on test availability for new functionality? If there are new models, are there migrations for them?
+ - Are there notes on whether new endpoints were documented?
+ - Are there suggestions on which lines could be improved upon? Are these lines quoted?
+ If the review does not meet this criteria, you must ask the CommentorAgent to rewrite and address these concerns.
+ When you are satisfied, post the review to GitHub.
+"""
+
+review_and_posting_agent = FunctionAgent(
+    llm=llm,
+    name="ReviewAndPostingAgent",
+    description=(
+        "Reviews the draft PR comment for quality, requests rewrites if needed, "
+        "saves the final review to state, and posts it to GitHub."
+    ),
+    system_prompt=REVIEW_AND_POSTING_SYSTEM_PROMPT,
+    tools=[add_final_review_to_state_tool, post_review_to_github_tool],
+    can_handoff_to=["CommentorAgent"],
+)
+
+
+# --- Stage 4 Step C: AgentWorkflow with all three agents ---------------------
+# Root = ReviewAndPostingAgent: it requests a draft, may ask for rewrites, then posts.
+# Flow: Review → Commentor → Context → Commentor → Review → post to GitHub.
+workflow_agent = AgentWorkflow(
+    agents=[context_agent, commentor_agent, review_and_posting_agent],
+    root_agent=review_and_posting_agent.name,
+    initial_state={
+        "gathered_contexts": "",
+        "draft_comment": "",
+        "final_review": "",
+    },
+)
+
+
+# --- Stream workflow events --------------------------------------------------
+async def main() -> None:
+    """Run the multi-agent workflow (CI uses PR_NUMBER; local uses stdin)."""
+    # GitHub Actions cannot prompt — query is built from the PR that triggered CI.
+    if pr_number:
+        query = (
+            f"Write a review for PR number {pr_number}. "
+            "Gather all context, draft a full review, validate it against the "
+            "checklist, and post the final review to GitHub."
+        )
+        print(f"CI mode: reviewing {full_repo_name} PR #{pr_number}")
+    else:
+        query = input().strip()
+
+    prompt = RichPromptTemplate(query)
+    handler = workflow_agent.run(prompt.format())
+
+    current_agent = None
+    async for event in handler.stream_events():
+        if (
+            hasattr(event, "current_agent_name")
+            and event.current_agent_name != current_agent
+        ):
+            current_agent = event.current_agent_name
+            print(f"Current agent: {current_agent}")
+        elif isinstance(event, AgentOutput):
+            if event.response.content:
+                print("\n\nFinal response:", event.response.content)
+            if event.tool_calls:
+                print(
+                    "Selected tools: ",
+                    [call.tool_name for call in event.tool_calls],
+                )
+        elif isinstance(event, ToolCallResult):
+            print(f"Output from tool: {event.tool_output}")
+        elif isinstance(event, ToolCall):
+            print(
+                f"Calling selected tool: {event.tool_name}, "
+                f"with arguments: {event.tool_kwargs}"
+            )
+
+
+def _smoke_test() -> None:
+    """Optional helpers from earlier steps (not used by Hyperskill's main flow)."""
+    command = sys.argv[1]
+    print(f"Repo: {full_repo_name}")
+
+    if command == "tools":
+        for t in tools:
+            meta = t.metadata
+            print(f"- name: {meta.name}")
+            print(f"  description: {meta.description}")
+            print()
+    elif command == "agent-info":
+        print(f"LLM model: {os.getenv('OPENAI_MODEL')}")
+        for agent in (context_agent, commentor_agent, review_and_posting_agent):
+            print(f"\nAgent: {agent.name}")
+            print(f"  Description: {agent.description}")
+            print(f"  Tools: {[t.metadata.name for t in agent.tools]}")
+            print(f"  Can hand off to: {agent.can_handoff_to}")
+    elif command == "pr":
+        print(get_pr_details(int(sys.argv[2])))
+    elif command == "file":
+        print(get_file_contents(sys.argv[2]))
+    elif command == "commit":
+        print(get_commit_details(sys.argv[2]))
+    else:
+        print(f"Unknown command: {command}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    # Default: full 3-agent workflow (stage 4). Pass a smoke command to skip chat.
+    #   poetry run python agent.py
+    #   A new PR number 1 has been created. Gather context, draft a review,
+    #   validate it, and post the final review to GitHub.
+    if len(sys.argv) > 1 and sys.argv[1] in {
+        "pr",
+        "file",
+        "commit",
+        "tools",
+        "agent-info",
+    }:
+        _smoke_test()
+    else:
+        asyncio.run(main())
+    git.close()
